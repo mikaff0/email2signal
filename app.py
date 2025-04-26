@@ -4,6 +4,8 @@ import requests
 import json
 import os
 import sys
+import email
+import html2text
 
 from typing import Dict
 from urllib.parse import urljoin
@@ -11,7 +13,16 @@ from urllib.parse import urljoin
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import Envelope, Session, SMTP
 from sendmail import send_mail
+from email import message_from_bytes
+from email.policy import default
 
+def header_decode(header):
+    hdr = ""
+    for text, encoding in email.header.decode_header(header):
+        if isinstance(text, bytes):
+            text = text.decode(encoding or "us-ascii")
+        hdr += text
+    return hdr
 
 class EmailHandler:
     def __init__(self, config: Dict[str, str]):
@@ -76,19 +87,39 @@ class EmailHandler:
             )
 
     async def send_signal(self, envelope: Envelope, signal_receivers: list[str]) -> bool:
-        # Remove carriage returns, they break the image checking regex
-        content = envelope.content.decode("utf8").replace("\r", "")
+        # Parse the email using the standard library
+        mail = message_from_bytes(envelope.content, policy=default)
+        body_part = mail.get_body(('html', 'plain'))
+        body = body_part.get_content() if body_part else ""
+        print("body", body)
+        
+        payload = {}
+        
+        # Decode subject line correctly (handles encoded headers)
+        subject = str(header_decode(mail.get('Subject')))
+        print("subject", subject)
+        msg = subject + "\r\n"
 
-        if match := re.search(self.subject_regex, content):
-            msg = match.group(1)
+        # Convert HTML to plain text if present
+        if "<!DOCTYPE html " in body:
+            html = "<!DOCTYPE html " + body.split('<!DOCTYPE html ', 1)[-1]
+            msg += html2text.html2text(html)
         else:
-            return False
+            msg += body
 
-        payload = {"message": msg, "number": self.config["sender_number"], "recipients": signal_receivers}
+        payload["message"] = msg
+        payload["number"] = self.config["sender_number"].replace("\\", "")
+        payload["recipients"] = signal_receivers
 
-        if match := re.search(self.image_regex, content):
-            image = match.group(1).replace("\n", "")
-            payload["base64_attachments"] = [image]
+        # --- Image processing from Function 1 ---
+        # Look for embedded base64 images in the body (e.g., <img src="data:image/...">)
+        image_regex = r"data:image\/[a-zA-Z]+;base64,([a-zA-Z0-9+/=\n\r]+)"
+        matches = re.findall(image_regex, body)
+
+        if matches:
+            # Clean up line breaks in base64 data
+            cleaned_images = [img.replace("\n", "").replace("\r", "") for img in matches]
+            payload["base64_attachments"] = cleaned_images
 
         headers = {"Content-Type": "application/json"}
 
